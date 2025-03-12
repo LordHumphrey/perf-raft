@@ -39,7 +39,7 @@ func BenchmarkStoreLogInMem(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		// Do some commits
-		applyAndWait(raft, 100, 10)
+		applyAndWait(raft, 1000000, 1024)
 		// Do a snapshot
 		NoErr(WaitFuture(raft.raft.Snapshot()), b)
 	}

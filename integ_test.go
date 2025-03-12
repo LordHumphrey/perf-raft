@@ -158,7 +158,7 @@ WAIT:
 }
 
 func WaitFuture(f Future) error {
-	timer := time.AfterFunc(1000*time.Millisecond, func() {
+	timer := time.AfterFunc(1000*30*time.Millisecond, func() {
 		panic(fmt.Errorf("timeout waiting for future %v", f))
 	})
 	defer timer.Stop()

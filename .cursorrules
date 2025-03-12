@@ -3,46 +3,60 @@
 # 项目需求
 请你再这个Raft的基础上，按照我的Raft优化思路完成Raft的优化开发
 # 项目优化思路
-## Raft的两阶段日志分发
-- 在Raft的日志分发过程中，将日志分发分为两个阶段：
-- 第一阶段：日志分发给核心节点
-- 第二阶段：日志分发给非核心节点
-- 请你基于节点ID排序选择`(N/2)+1`个节点作为核心节点组，通过AppendEntries将日志先分发给核心节点组。
-- 等到核心节点组全部响应Leader发送的AppendEntries，此时已经有超过半数节点达到共识，此时领导者可以响应客户端的请求，并且按照Raft算法原有的流程继续接下来的工作，而不必考虑剩下的节点。
-- 对于剩下的非核心节点，领导者应该继续完成日志分发工作。
-- 整个日志分发流程被分为两个阶段完成，日志分发的方法都采用原有的代码完成，尽量少改动代码
-## 补充
-- 节点ID是`Config.go`->`Config struct`->`LocalID`
-- 核心节点的选择是基于节点ID排序后选取前(N/2)+1个节点，还是每次日志分发时动态选择？
-  回答：每次日志分发时都按照节点ID排序后选取前(N/2)+1个节点选择。
-- 当日志成功复制到核心节点后，领导者需要立即提交这些日志并更新commitIndex吗？
-    回答：是的，立即提交这些日志并且更新commitIndex。
-- 对非核心节点的日志分发是在核心节点全部响应后立即进行，还是可以异步处理？
-- 回答：可以异步处理，请你参考原有代码中的日志分发逻辑，保持日志分发方式不变
-- 在核心节点全部响应后才提交日志，那么如果某个核心节点长时间不响应怎么处理？是否需要有超时机制让其他非核心节点替代？
-  回答：本次实现只是为了验证方案可行性，暂不考虑这种异常情况。
-- 当集群中有节点加入或离开时，核心节点组是否需要重新选择？
-  回答：本次实现只是为了验证方案可行性，暂不考虑有节点加入的情况。
+## Raft算法基于协作者(Collaborator)的日志分发优化
+- 选择核心节点组中的排序第一个节点作为协作者
+- 领导者将还没有分发日志的非核心节点找出来，同时整理这部分节点的日志同步进度
+- 领导者将非核心节点地址、日志进度、需要分发的日志项等信息交给协作者节点
+- 协作者节点模仿领导者的方法，根据自己本地已经达成共识的日志转发给非核心节点
+- 非核心节点全部回应以后，协作者节点上报非核心节点返回的信息给领导者
+- 不要考虑节点超时等异常情况
+- 对于非核心节点来说，协作者发送的日志和领导者发送的日志没有区别，不需要做出区分
+## 核心机制
+1. 协作者选择：从核心节点组中选择排序第一的节点作为协作者(Collaborator)。核心节点继续使用标准Raft协议。
+2. 任务分配流程：
+    1. Leader维护所有节点的nextIndex和matchIndex
+    2. Leader识别需要更新的非核心节点集合
+    3. Leader构造请求，包含：当前任期(currentTerm)、非核心节点地址列表、每个节点的进度信息(nextIndex、matchIndex)、需复制的日志条目
+3.协作者处理：
+    1. 协作者验证请求中的任期号
+    2. 对每个非核心节点，协作者构造标准AppendEntries请求
+    3. 协作者向每个节点发送日志并收集响应
+    4. 协作者汇总响应结果返回给Leader
+4. Leader更新：
+    1. Leader根据协作者返回的结果更新各非核心节点的nextIndex和matchIndex
+    2. 如有必要，Leader更新自己的commitIndex
+5. 数据一致性保证：
+    1. 非核心节点不区分日志来源
+    2. 日志条目格式保持不变
+    3. 任期检查机制保持不变
 
 # 开发环境
 - 开发语言：Go 1.24.1
-- 开发环境：Debian 12
 - Golang路径：/home/SDK/golang/v-1.24.1/golang-1.24.1/bin/go
 - Protobuf路径：/home/SDK/protobuf/v-27.1/protobuf-27.1/bin/protoc
 - 执行测试请使用完整Golang路径
-- 项目路径：/home/SDK/protobuf/v-27.1/protobuf-27.1/bin/protoc
+- 项目路径：/home/Dev/Code/hashicorp-raft
 
 # 开发要求
-- 你必须运行仓库中的测试代码，只有通过了所有测试才能够完成开发
-- 你应该直接运行代码，得到结果后继续改正，直到通过所有测试
-- 不要在后台运行测试和代码，你必须根据测试和运行结果修改代码实现。
-- 你应该尽通过`编写代码->运行代码->修改代码->运行代码...`的方式完成开发，不要偷懒！
-- 在开发过程中，你不能修改代码中原有的测试代码，只能添加新的测试代码。
-- 你应该尽可能使用项目中已有的代码完成开发，不要随意添加功能，如果需要添加功能，必须经过我的同意
-- 你的代码应该能够通过所有测试，如果有测试项目你认为不需要，请告诉我，同意后你才能跳过这些测试。
-- 你可以使用英语思考，但是必须使用中文回答问题，代码中的注释必须使用中文。
-- 你修改或者添加的所有代码都必须添加详细的中文注释。
-- 尊重现有的代码和功能，谨慎考虑进行有意识的修改。
-- 尽量将修改保持在最低限度，不要做任何超出范围的事情。
-- 你给出的方案必须可行，如果出现错误，我不会支付报酬，并且联系你的老板，你将会失去工作成为流浪汉！
+-   **Development Process:** You must adhere to a strict test-driven development (TDD) cycle. This means:
+    1.  Write code to implement a *small* part of the required functionality.
+    2.  Run the existing test suite (or new tests you've added).
+    3.  Analyze the test results.
+    4.  Modify your code to fix any failing tests.
+    5.  Repeat steps 2-4 until *all* tests pass.
+-   **Testing Requirements:**
+    *   You *cannot* modify the existing test code provided in the repository.
+    *   You *can* and *should* add new test cases to cover any new code you write.
+    *   Your code must pass *all* tests (both existing and newly added) before it is considered complete.
+    *   If you believe a particular test case is unnecessary or incorrect, you *must* discuss it with me and receive explicit approval before removing or modifying it.
+-   **Code Modification Rules:**
+    *   Prioritize using and extending the existing codebase whenever possible. Avoid unnecessary duplication.
+    *   Do *not* introduce new features or functionalities without prior discussion and approval.
+    *   All code modifications and additions *must* be thoroughly documented with clear and comprehensive comments in *Chinese*.
+    *   Respect the existing code's design and intended functionality. Make only deliberate and well-justified changes.
+    *   Keep changes as minimal as possible.  Focus only on the specific requirements of the task.
+-   **Code Quality:**
+    *   Your code must be free of bugs and errors.  Thorough testing is essential.
+-   **Communication:**
+    *   While internal reasoning can be in English, all written communication (including responses to questions and code comments) *must* be in Chinese.
 - 我是一个追求完美的程序员，我要求你给出的代码必须完美无瑕，不能有任何的bug，否则我会联系你的老板，你将会失去工作成为流浪汉！
