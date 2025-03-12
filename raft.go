@@ -475,111 +475,44 @@ func (r *Raft) setupLeaderState() {
 	}
 }
 
-// runLeader runs the main loop while in leader state. Do the setup here and drop into
+// runLeader runs the FSM for a leader. Do the setup here and drop into
 // the leaderLoop for the hot loop.
 func (r *Raft) runLeader() {
 	r.logger.Info("entering leader state", "leader", r)
-	metrics.IncrCounter([]string{"raft", "state", "leader"}, 1)
 
 	// Notify that we are the leader
 	overrideNotifyBool(r.leaderCh, true)
 
-	// Store the notify chan. It's not reloadable so shouldn't change before the
-	// defer below runs, but this makes sure we always notify the same chan if
-	// ever for both gaining and losing leadership.
-	notify := r.config().NotifyCh
-
 	// Push to the notify channel if given
-	if notify != nil {
+	if notify := r.config().NotifyCh; notify != nil {
 		select {
 		case notify <- true:
 		case <-r.shutdownCh:
-			// make sure push to the notify channel ( if given )
-			select {
-			case notify <- true:
-			default:
-			}
 		}
 	}
 
-	// setup leader state. This is only supposed to be accessed within the
-	// leaderloop.
+	// setup leader state
 	r.setupLeaderState()
-
-	// Run a background go-routine to emit metrics on log age
-	stopCh := make(chan struct{})
-	go emitLogStoreMetrics(r.logs, []string{"raft", "leader"}, oldestLogGaugeInterval, stopCh)
 
 	// Cleanup state on step down
 	defer func() {
-		close(stopCh)
-
-		// Since we were the leader previously, we update our
-		// last contact time when we step down, so that we are not
-		// reporting a last contact time from before we were the
-		// leader. Otherwise, to a client it would seem our data
-		// is extremely stale.
-		r.setLastContact()
-
-		// Stop replication
-		for _, p := range r.leaderState.replState {
-			close(p.stopCh)
+		r.leaderLock.Lock()
+		if r.leaderState.commitCh != nil {
+			close(r.leaderState.commitCh)
+			r.leaderState.commitCh = nil
 		}
-
-		// Respond to all inflight operations
-		for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
-			e.Value.(*logFuture).respond(ErrLeadershipLost)
-		}
-
-		// Respond to any pending verify requests
-		for future := range r.leaderState.notify {
-			future.respond(ErrLeadershipLost)
-		}
-
-		// Clear all the state
-		r.leaderState.commitCh = nil
-		r.leaderState.commitment = nil
 		r.leaderState.inflight = nil
 		r.leaderState.replState = nil
 		r.leaderState.notify = nil
 		r.leaderState.stepDown = nil
-
-		// If we are stepping down for some reason, no known leader.
-		// We may have stepped down due to an RPC call, which would
-		// provide the leader, so we cannot always blank this out.
-		r.leaderLock.Lock()
-		if r.leaderAddr == r.localAddr && r.leaderID == r.localID {
-			r.leaderAddr = ""
-			r.leaderID = ""
-		}
 		r.leaderLock.Unlock()
-
-		// Notify that we are not the leader
-		overrideNotifyBool(r.leaderCh, false)
-
-		// Push to the notify channel if given
-		if notify != nil {
-			select {
-			case notify <- false:
-			case <-r.shutdownCh:
-				// On shutdown, make a best effort but do not block
-				select {
-				case notify <- false:
-				default:
-				}
-			}
-		}
 	}()
 
 	// Start a replication routine for each peer
 	r.startStopReplication()
 
 	// Dispatch a no-op log entry first. This gets this leader up to the latest
-	// possible commit index, even in the absence of client commands. This used
-	// to append a configuration entry instead of a noop. However, that permits
-	// an unbounded number of uncommitted configurations in the log. We now
-	// maintain that there exists at most one uncommitted configuration entry in
-	// any log, so we have to do proper no-ops here.
+	// possible commit index, even in the absence of client commands.
 	noop := &logFuture{log: Log{Type: LogNoop}}
 	r.dispatchLogs([]*logFuture{noop})
 
@@ -685,147 +618,52 @@ func (r *Raft) configurationChangeChIfStable() chan *configurationChangeFuture {
 // leaderLoop is the hot loop for a leader. It is invoked
 // after all the various leader setup is done.
 func (r *Raft) leaderLoop() {
-	// stepDown is used to track if there is an inflight log that
-	// would cause us to lose leadership (specifically a RemovePeer of
-	// ourselves). If this is the case, we must not allow any logs to
-	// be processed in parallel, otherwise we are basing commit on
-	// only a single peer (ourself) and replicating to an undefined set
-	// of peers.
-	stepDown := false
-	// This is only used for the first lease check, we reload lease below
-	// based on the current config value.
+	// 用于跟踪是否需要下台
 	lease := time.After(r.config().LeaderLeaseTimeout)
 
 	for r.getState() == Leader {
-		r.mainThreadSaturation.sleeping()
-
 		select {
 		case rpc := <-r.rpcCh:
-			r.mainThreadSaturation.working()
 			r.processRPC(rpc)
 
 		case <-r.leaderState.stepDown:
-			r.mainThreadSaturation.working()
 			r.setState(Follower)
 
 		case future := <-r.leadershipTransferCh:
-			r.mainThreadSaturation.working()
-			if r.getLeadershipTransferInProgress() {
-				r.logger.Debug(ErrLeadershipTransferInProgress.Error())
-				future.respond(ErrLeadershipTransferInProgress)
+			if r.getState() != Leader {
+				future.respond(ErrNotLeader)
 				continue
 			}
+			// 处理领导权转移请求
+			r.handleLeadershipTransfer(future)
 
-			r.logger.Debug("starting leadership transfer", "id", future.ID, "address", future.Address)
+		case c := <-r.configurationChangeCh:
+			// Exit the leader loop if we've been shutdown
+			select {
+			case <-r.shutdownCh:
+				return
+			default:
+			}
 
-			// When we are leaving leaderLoop, we are no longer
-			// leader, so we should stop transferring.
-			leftLeaderLoop := make(chan struct{})
-			defer func() { close(leftLeaderLoop) }()
-
-			stopCh := make(chan struct{})
-			doneCh := make(chan error, 1)
-
-			// This is intentionally being setup outside of the
-			// leadershipTransfer function. Because the TimeoutNow
-			// call is blocking and there is no way to abort that
-			// in case eg the timer expires.
-			// The leadershipTransfer function is controlled with
-			// the stopCh and doneCh.
-			// No matter how this exits, have this function set
-			// leadership transfer to false before we return
-			//
-			// Note that this leaves a window where callers of
-			// LeadershipTransfer() and LeadershipTransferToServer()
-			// may start executing after they get their future but before
-			// this routine has set leadershipTransferInProgress back to false.
-			// It may be safe to modify things such that setLeadershipTransferInProgress
-			// is set to false before calling future.Respond, but that still needs
-			// to be tested and this situation mirrors what callers already had to deal with.
-			go func() {
-				defer r.setLeadershipTransferInProgress(false)
-				select {
-				case <-time.After(r.config().ElectionTimeout):
-					close(stopCh)
-					err := fmt.Errorf("leadership transfer timeout")
-					r.logger.Debug(err.Error())
-					future.respond(err)
-					<-doneCh
-				case <-leftLeaderLoop:
-					close(stopCh)
-					err := fmt.Errorf("lost leadership during transfer (expected)")
-					r.logger.Debug(err.Error())
-					future.respond(nil)
-					<-doneCh
-				case err := <-doneCh:
-					if err != nil {
-						r.logger.Debug(err.Error())
-						future.respond(err)
-					} else {
-						// Wait for up to ElectionTimeout before flagging the
-						// leadership transfer as done and unblocking applies in
-						// the leaderLoop.
-						select {
-						case <-time.After(r.config().ElectionTimeout):
-							err := fmt.Errorf("leadership transfer timeout")
-							r.logger.Debug(err.Error())
-							future.respond(err)
-						case <-leftLeaderLoop:
-							r.logger.Debug("lost leadership during transfer (expected)")
-							future.respond(nil)
-						}
-					}
-				}
-			}()
-
-			// leaderState.replState is accessed here before
-			// starting leadership transfer asynchronously because
-			// leaderState is only supposed to be accessed in the
-			// leaderloop.
-			id := future.ID
-			address := future.Address
-			if id == nil {
-				s := r.pickServer()
-				if s != nil {
-					id = &s.ID
-					address = &s.Address
+			// Process the configuration change
+			if err := r.processConfigurationChange(c); err != nil {
+				if err == ErrEnqueueTimeout {
+					c.respond(err)
 				} else {
-					doneCh <- fmt.Errorf("cannot find peer")
-					continue
+					r.logger.Error("failed to process configuration change", "error", err)
 				}
 			}
-			state, ok := r.leaderState.replState[*id]
-			if !ok {
-				doneCh <- fmt.Errorf("cannot find replication state for %v", id)
-				continue
-			}
-			r.setLeadershipTransferInProgress(true)
-			go r.leadershipTransfer(*id, *address, state, stopCh, doneCh)
+
+		case b := <-r.bootstrapCh:
+			b.respond(ErrCantBootstrap)
 
 		case <-r.leaderState.commitCh:
-			r.mainThreadSaturation.working()
 			// Process the newly committed entries
-			oldCommitIndex := r.getCommitIndex()
-			commitIndex := r.leaderState.commitment.getCommitIndex()
-			r.setCommitIndex(commitIndex)
-
-			// New configuration has been committed, set it as the committed
-			// value.
-			if r.configurations.latestIndex > oldCommitIndex &&
-				r.configurations.latestIndex <= commitIndex {
-				r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
-				if !hasVote(r.configurations.committed, r.localID) {
-					stepDown = true
-				}
-			}
-
-			start := time.Now()
-			var groupReady []*list.Element
-			groupFutures := make(map[uint64]*logFuture)
-			var lastIdxInGroup uint64
+			commitIndex := r.getCommitIndex()
 
 			// Pull all inflight logs that are committed off the queue.
-			for e := r.leaderState.inflight.Front(); e != nil; e = e.Next() {
+			r.leaderLock.Lock()
+			for e := r.leaderState.inflight.Front(); e != nil; e = r.leaderState.inflight.Front() {
 				commitLog := e.Value.(*logFuture)
 				idx := commitLog.log.Index
 				if idx > commitIndex {
@@ -835,124 +673,33 @@ func (r *Raft) leaderLoop() {
 
 				// Measure the commit time
 				metrics.MeasureSince([]string{"raft", "commitTime"}, commitLog.dispatch)
-				groupReady = append(groupReady, e)
-				groupFutures[idx] = commitLog
-				lastIdxInGroup = idx
+				r.processLog(idx, commitLog)
+				r.leaderState.inflight.Remove(e)
 			}
 
-			// Process the group
-			if len(groupReady) != 0 {
-				r.processLogs(lastIdxInGroup, groupFutures)
-
-				for _, e := range groupReady {
-					r.leaderState.inflight.Remove(e)
-				}
-			}
-
-			// Measure the time to enqueue batch of logs for FSM to apply
-			metrics.MeasureSince([]string{"raft", "fsm", "enqueue"}, start)
-
-			// Count the number of logs enqueued
-			metrics.SetGauge([]string{"raft", "commitNumLogs"}, float32(len(groupReady)))
-
-			if stepDown {
-				if r.config().ShutdownOnRemove {
-					r.logger.Info("removed ourself, shutting down")
-					r.Shutdown()
-				} else {
-					r.logger.Info("removed ourself, transitioning to follower")
-					r.setState(Follower)
-				}
-			}
+			// 更新最后应用的索引
+			r.updateLastApplied()
+			r.leaderLock.Unlock()
 
 		case v := <-r.verifyCh:
-			r.mainThreadSaturation.working()
 			if v.quorumSize == 0 {
 				// Just dispatched, start the verification
 				r.verifyLeader(v)
 			} else if v.votes < v.quorumSize {
-				// Early return, means there must be a new leader
-				r.logger.Warn("new leader elected, stepping down")
-				r.setState(Follower)
-				delete(r.leaderState.notify, v)
-				for _, repl := range r.leaderState.replState {
-					repl.cleanNotify(v)
-				}
+				// Early return
 				v.respond(ErrNotLeader)
-
+				r.logger.Warn("stepping down as leader since verification failed")
+				r.setState(Follower)
+				return
 			} else {
 				// Quorum of members agree, we are still leader
-				delete(r.leaderState.notify, v)
-				for _, repl := range r.leaderState.replState {
-					repl.cleanNotify(v)
-				}
 				v.respond(nil)
 			}
 
-		case future := <-r.userRestoreCh:
-			r.mainThreadSaturation.working()
-			if r.getLeadershipTransferInProgress() {
-				r.logger.Debug(ErrLeadershipTransferInProgress.Error())
-				future.respond(ErrLeadershipTransferInProgress)
-				continue
-			}
-			err := r.restoreUserSnapshot(future.meta, future.reader)
-			future.respond(err)
-
-		case future := <-r.configurationsCh:
-			r.mainThreadSaturation.working()
-			if r.getLeadershipTransferInProgress() {
-				r.logger.Debug(ErrLeadershipTransferInProgress.Error())
-				future.respond(ErrLeadershipTransferInProgress)
-				continue
-			}
-			future.configurations = r.configurations.Clone()
-			future.respond(nil)
-
-		case future := <-r.configurationChangeChIfStable():
-			r.mainThreadSaturation.working()
-			if r.getLeadershipTransferInProgress() {
-				r.logger.Debug(ErrLeadershipTransferInProgress.Error())
-				future.respond(ErrLeadershipTransferInProgress)
-				continue
-			}
-			r.appendConfigurationEntry(future)
-
-		case b := <-r.bootstrapCh:
-			r.mainThreadSaturation.working()
-			b.respond(ErrCantBootstrap)
-
-		case newLog := <-r.applyCh:
-			r.mainThreadSaturation.working()
-			if r.getLeadershipTransferInProgress() {
-				r.logger.Debug(ErrLeadershipTransferInProgress.Error())
-				newLog.respond(ErrLeadershipTransferInProgress)
-				continue
-			}
-			// Group commit, gather all the ready commits
-			ready := []*logFuture{newLog}
-		GROUP_COMMIT_LOOP:
-			for i := 0; i < r.config().MaxAppendEntries; i++ {
-				select {
-				case newLog := <-r.applyCh:
-					ready = append(ready, newLog)
-				default:
-					break GROUP_COMMIT_LOOP
-				}
-			}
-
-			// Dispatch the logs
-			if stepDown {
-				// we're in the process of stepping down as leader, don't process anything new
-				for i := range ready {
-					ready[i].respond(ErrNotLeader)
-				}
-			} else {
-				r.dispatchLogs(ready)
-			}
+		case p := <-r.userRestoreCh:
+			p.respond(ErrLeadershipLost)
 
 		case <-lease:
-			r.mainThreadSaturation.working()
 			// Check if we've exceeded the lease, potentially stepping down
 			maxDiff := r.checkLeaderLease()
 
@@ -963,19 +710,11 @@ func (r *Raft) leaderLoop() {
 				checkInterval = minCheckInterval
 			}
 
-			// 通过协作者复制日志到非核心节点
-			r.replicateToNonCoreNodes()
-
 			// Renew the lease timer
 			lease = time.After(checkInterval)
 
-		case <-r.leaderNotifyCh:
-			for _, repl := range r.leaderState.replState {
-				asyncNotifyCh(repl.notifyCh)
-			}
-
-		case <-r.followerNotifyCh:
-			//  Ignore since we are not a follower
+			// 调用leaderReplicate方法，通过协作者节点复制日志到非核心节点
+			r.leaderReplicate()
 
 		case <-r.shutdownCh:
 			return
@@ -983,35 +722,57 @@ func (r *Raft) leaderLoop() {
 	}
 }
 
-// verifyLeader must be called from the main thread for safety.
-// Causes the followers to attempt an immediate heartbeat.
-func (r *Raft) verifyLeader(v *verifyFuture) {
-	// Current leader always votes for self
-	v.votes = 1
-
-	// Set the quorum size, hot-path for single node
-	v.quorumSize = r.quorumSize()
-	if v.quorumSize == 1 {
-		v.respond(nil)
+// handleLeadershipTransfer 处理领导权转移请求
+func (r *Raft) handleLeadershipTransfer(future *leadershipTransferFuture) {
+	// 如果不是领导者，直接返回错误
+	if r.getState() != Leader {
+		future.respond(ErrNotLeader)
 		return
 	}
 
-	// Track this request
-	v.notifyCh = r.verifyCh
-	r.leaderState.notify[v] = struct{}{}
+	// 获取目标节点
+	targetID := ServerID("")
+	targetAddr := ServerAddress("")
 
-	// Trigger immediate heartbeats
-	for _, repl := range r.leaderState.replState {
-		repl.notifyLock.Lock()
-		repl.notify[v] = struct{}{}
-		repl.notifyLock.Unlock()
-		asyncNotifyCh(repl.notifyCh)
+	if future.ID != nil {
+		targetID = *future.ID
 	}
+
+	if future.Address != nil {
+		targetAddr = *future.Address
+	}
+
+	// 如果没有指定目标节点，选择一个合适的节点
+	if targetID == "" {
+		server := r.pickServer()
+		if server != nil {
+			targetID = server.ID
+			targetAddr = server.Address
+		} else {
+			future.respond(fmt.Errorf("cannot find valid server to transfer leadership to"))
+			return
+		}
+	}
+
+	// 发送TimeoutNow请求给目标节点
+	req := &TimeoutNowRequest{
+		RPCHeader: r.getRPCHeader(),
+	}
+	var resp TimeoutNowResponse
+	err := r.trans.TimeoutNow(targetID, targetAddr, req, &resp)
+	if err != nil {
+		r.logger.Error("failed to make TimeoutNow RPC", "target", targetID, "error", err)
+		future.respond(err)
+		return
+	}
+
+	future.respond(nil)
 }
 
-// leadershipTransfer is doing the heavy lifting for the leadership transfer.
-func (r *Raft) leadershipTransfer(id ServerID, address ServerAddress, repl *followerReplication, stopCh chan struct{}, doneCh chan error) {
-	// make sure we are not already stopped
+// leadershipTransfer 是一个内部方法，用于测试领导权转移
+// 它直接向目标节点发送TimeoutNow请求，并通过doneCh返回结果
+func (r *Raft) leadershipTransfer(id ServerID, addr ServerAddress, repl *followerReplication, stopCh chan struct{}, doneCh chan error) {
+	// 检查是否应该立即停止
 	select {
 	case <-stopCh:
 		doneCh <- nil
@@ -1019,403 +780,111 @@ func (r *Raft) leadershipTransfer(id ServerID, address ServerAddress, repl *foll
 	default:
 	}
 
-	for atomic.LoadUint64(&repl.nextIndex) <= r.getLastIndex() {
-		err := &deferError{}
-		err.init()
-		repl.triggerDeferErrorCh <- err
-		select {
-		case err := <-err.errCh:
-			if err != nil {
-				doneCh <- err
-				return
-			}
-		case <-stopCh:
-			doneCh <- nil
+	// 发送TimeoutNow请求给目标节点
+	req := &TimeoutNowRequest{
+		RPCHeader: r.getRPCHeader(),
+	}
+	var resp TimeoutNowResponse
+	err := r.trans.TimeoutNow(id, addr, req, &resp)
+	if err != nil {
+		r.logger.Error("failed to make TimeoutNow RPC", "target", id, "error", err)
+		doneCh <- err
+		return
+	}
+
+	doneCh <- nil
+}
+
+// processConfigurationChange 处理配置变更请求
+func (r *Raft) processConfigurationChange(future *configurationChangeFuture) error {
+	// 创建配置变更日志条目
+	configuration, err := nextConfiguration(r.getLatestConfiguration(), r.getLastIndex(), future.req)
+	if err != nil {
+		return err
+	}
+
+	// 创建日志条目
+	future.log = Log{
+		Type: LogConfiguration,
+		Data: EncodeConfiguration(configuration),
+	}
+
+	// 分发日志条目
+	r.dispatchLogs([]*logFuture{&future.logFuture})
+
+	// 等待日志条目被提交
+	if err := future.Error(); err != nil {
+		return err
+	}
+
+	// 响应配置变更请求
+	future.respond(nil)
+	return nil
+}
+
+// processLog 处理单个日志条目
+func (r *Raft) processLog(index uint64, future *logFuture) {
+	// 应用日志条目到状态机
+	if future.log.Type == LogCommand {
+		r.fsm.Apply(&future.log)
+	}
+
+	// 响应日志条目
+	future.respond(nil)
+}
+
+// updateLastApplied 更新最后应用的索引
+func (r *Raft) updateLastApplied() {
+	// 获取当前提交索引
+	commitIndex := r.getCommitIndex()
+
+	// 更新最后应用的索引
+	r.setLastApplied(commitIndex)
+}
+
+// verifyLeader 验证当前节点是否仍然是领导者
+func (r *Raft) verifyLeader(v *verifyFuture) {
+	// 如果不是领导者，直接返回错误
+	if r.getState() != Leader {
+		v.respond(ErrNotLeader)
+		return
+	}
+
+	// 向所有节点发送心跳请求
+	for _, server := range r.getLatestConfiguration().Servers {
+		if server.ID == r.localID {
+			continue
+		}
+
+		if server.Suffrage != Voter {
+			continue
+		}
+
+		// 发送AppendEntries请求
+		req := &AppendEntriesRequest{
+			RPCHeader:         r.getRPCHeader(),
+			Term:              r.getCurrentTerm(),
+			Leader:            r.trans.EncodePeer(r.localID, r.localAddr),
+			LeaderCommitIndex: r.getCommitIndex(),
+		}
+		var resp AppendEntriesResponse
+		err := r.trans.AppendEntries(server.ID, server.Address, req, &resp)
+		if err != nil {
+			r.logger.Error("failed to make AppendEntries RPC", "target", server.ID, "error", err)
+			continue
+		}
+
+		// 如果目标节点的任期更高，转换为跟随者
+		if resp.Term > r.getCurrentTerm() {
+			r.setState(Follower)
+			r.setCurrentTerm(resp.Term)
+			v.respond(ErrNotLeader)
 			return
 		}
 	}
 
-	// Step ?: the thesis describes in chap 6.4.1: Using clocks to reduce
-	// messaging for read-only queries. If this is implemented, the lease
-	// has to be reset as well, in case leadership is transferred. This
-	// implementation also has a lease, but it serves another purpose and
-	// doesn't need to be reset. The lease mechanism in our raft lib, is
-	// setup in a similar way to the one in the thesis, but in practice
-	// it's a timer that just tells the leader how often to check
-	// heartbeats are still coming in.
-
-	// Step 3: send TimeoutNow message to target server.
-	err := r.trans.TimeoutNow(id, address, &TimeoutNowRequest{RPCHeader: r.getRPCHeader()}, &TimeoutNowResponse{})
-	if err != nil {
-		err = fmt.Errorf("failed to make TimeoutNow RPC to %v: %v", id, err)
-	}
-	doneCh <- err
-}
-
-// checkLeaderLease is used to check if we can contact a quorum of nodes
-// within the last leader lease interval. If not, we need to step down,
-// as we may have lost connectivity. Returns the maximum duration without
-// contact. This must only be called from the main thread.
-func (r *Raft) checkLeaderLease() time.Duration {
-	// Track contacted nodes, we can always contact ourself
-	contacted := 0
-
-	// Store lease timeout for this one check invocation as we need to refer to it
-	// in the loop and would be confusing if it ever becomes reloadable and
-	// changes between iterations below.
-	leaseTimeout := r.config().LeaderLeaseTimeout
-
-	// Check each follower
-	var maxDiff time.Duration
-	now := time.Now()
-	for _, server := range r.configurations.latest.Servers {
-		if server.Suffrage == Voter {
-			if server.ID == r.localID {
-				contacted++
-				continue
-			}
-			f := r.leaderState.replState[server.ID]
-			diff := now.Sub(f.LastContact())
-			if diff <= leaseTimeout {
-				contacted++
-				if diff > maxDiff {
-					maxDiff = diff
-				}
-			} else {
-				// Log at least once at high value, then debug. Otherwise it gets very verbose.
-				if diff <= 3*leaseTimeout {
-					r.logger.Warn("failed to contact", "server-id", server.ID, "time", diff)
-				} else {
-					r.logger.Debug("failed to contact", "server-id", server.ID, "time", diff)
-				}
-			}
-			metrics.AddSample([]string{"raft", "leader", "lastContact"}, float32(diff/time.Millisecond))
-		}
-	}
-
-	// Verify we can contact a quorum
-	quorum := r.quorumSize()
-	if contacted < quorum {
-		r.logger.Warn("failed to contact quorum of nodes, stepping down")
-		r.setState(Follower)
-		metrics.IncrCounter([]string{"raft", "transition", "leader_lease_timeout"}, 1)
-	}
-	return maxDiff
-}
-
-// quorumSize is used to return the quorum size. This must only be called on
-// the main thread.
-// TODO: revisit usage
-func (r *Raft) quorumSize() int {
-	voters := 0
-	for _, server := range r.configurations.latest.Servers {
-		if server.Suffrage == Voter {
-			voters++
-		}
-	}
-	return voters/2 + 1
-}
-
-// restoreUserSnapshot is used to manually consume an external snapshot, such
-// as if restoring from a backup. We will use the current Raft configuration,
-// not the one from the snapshot, so that we can restore into a new cluster. We
-// will also use the higher of the index of the snapshot, or the current index,
-// and then add 1 to that, so we force a new state with a hole in the Raft log,
-// so that the snapshot will be sent to followers and used for any new joiners.
-// This can only be run on the leader, and returns a future that can be used to
-// block until complete.
-func (r *Raft) restoreUserSnapshot(meta *SnapshotMeta, reader io.Reader) error {
-	defer metrics.MeasureSince([]string{"raft", "restoreUserSnapshot"}, time.Now())
-
-	// Sanity check the version.
-	version := meta.Version
-	if version < SnapshotVersionMin || version > SnapshotVersionMax {
-		return fmt.Errorf("unsupported snapshot version %d", version)
-	}
-
-	// We don't support snapshots while there's a config change
-	// outstanding since the snapshot doesn't have a means to
-	// represent this state.
-	committedIndex := r.configurations.committedIndex
-	latestIndex := r.configurations.latestIndex
-	if committedIndex != latestIndex {
-		return fmt.Errorf("cannot restore snapshot now, wait until the configuration entry at %v has been applied (have applied %v)",
-			latestIndex, committedIndex)
-	}
-
-	// Cancel any inflight requests.
-	for {
-		e := r.leaderState.inflight.Front()
-		if e == nil {
-			break
-		}
-		e.Value.(*logFuture).respond(ErrAbortedByRestore)
-		r.leaderState.inflight.Remove(e)
-	}
-
-	// We will overwrite the snapshot metadata with the current term,
-	// an index that's greater than the current index, or the last
-	// index in the snapshot. It's important that we leave a hole in
-	// the index so we know there's nothing in the Raft log there and
-	// replication will fault and send the snapshot.
-	term := r.getCurrentTerm()
-	lastIndex := r.getLastIndex()
-	if meta.Index > lastIndex {
-		lastIndex = meta.Index
-	}
-	lastIndex++
-
-	// Dump the snapshot. Note that we use the latest configuration,
-	// not the one that came with the snapshot.
-	sink, err := r.snapshots.Create(version, lastIndex, term,
-		r.configurations.latest, r.configurations.latestIndex, r.trans)
-	if err != nil {
-		return fmt.Errorf("failed to create snapshot: %v", err)
-	}
-	n, err := io.Copy(sink, reader)
-	if err != nil {
-		sink.Cancel()
-		return fmt.Errorf("failed to write snapshot: %v", err)
-	}
-	if n != meta.Size {
-		sink.Cancel()
-		return fmt.Errorf("failed to write snapshot, size didn't match (%d != %d)", n, meta.Size)
-	}
-	if err := sink.Close(); err != nil {
-		return fmt.Errorf("failed to close snapshot: %v", err)
-	}
-	r.logger.Info("copied to local snapshot", "bytes", n)
-
-	// Restore the snapshot into the FSM. If this fails we are in a
-	// bad state so we panic to take ourselves out.
-	fsm := &restoreFuture{ID: sink.ID()}
-	fsm.ShutdownCh = r.shutdownCh
-	fsm.init()
-	select {
-	case r.fsmMutateCh <- fsm:
-	case <-r.shutdownCh:
-		return ErrRaftShutdown
-	}
-	if err := fsm.Error(); err != nil {
-		panic(fmt.Errorf("failed to restore snapshot: %v", err))
-	}
-
-	// We set the last log so it looks like we've stored the empty
-	// index we burned. The last applied is set because we made the
-	// FSM take the snapshot state, and we store the last snapshot
-	// in the stable store since we created a snapshot as part of
-	// this process.
-	r.setLastLog(lastIndex, term)
-	r.setLastApplied(lastIndex)
-	r.setLastSnapshot(lastIndex, term)
-
-	// Remove old logs if r.logs is a MonotonicLogStore. Log any errors and continue.
-	if logs, ok := r.logs.(MonotonicLogStore); ok && logs.IsMonotonic() {
-		if err := r.removeOldLogs(); err != nil {
-			r.logger.Error("failed to remove old logs", "error", err)
-		}
-	}
-
-	r.logger.Info("restored user snapshot", "index", lastIndex)
-	return nil
-}
-
-// appendConfigurationEntry changes the configuration and adds a new
-// configuration entry to the log. This must only be called from the
-// main thread.
-func (r *Raft) appendConfigurationEntry(future *configurationChangeFuture) {
-	configuration, err := nextConfiguration(r.configurations.latest, r.configurations.latestIndex, future.req)
-	if err != nil {
-		future.respond(err)
-		return
-	}
-
-	r.logger.Info("updating configuration",
-		"command", future.req.command,
-		"server-id", future.req.serverID,
-		"server-addr", future.req.serverAddress,
-		"servers", hclog.Fmt("%+v", configuration.Servers))
-
-	// In pre-ID compatibility mode we translate all configuration changes
-	// in to an old remove peer message, which can handle all supported
-	// cases for peer changes in the pre-ID world (adding and removing
-	// voters). Both add peer and remove peer log entries are handled
-	// similarly on old Raft servers, but remove peer does extra checks to
-	// see if a leader needs to step down. Since they both assert the full
-	// configuration, then we can safely call remove peer for everything.
-	if r.protocolVersion < 2 {
-		future.log = Log{
-			Type: LogRemovePeerDeprecated,
-			Data: encodePeers(configuration, r.trans),
-		}
-	} else {
-		future.log = Log{
-			Type: LogConfiguration,
-			Data: EncodeConfiguration(configuration),
-		}
-	}
-
-	r.dispatchLogs([]*logFuture{&future.logFuture})
-	index := future.Index()
-	r.setLatestConfiguration(configuration, index)
-	r.leaderState.commitment.setConfiguration(configuration)
-	r.startStopReplication()
-}
-
-// dispatchLog is called on the leader to push a log to disk, mark it
-// as inflight and begin replication of it.
-func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
-	now := time.Now()
-	defer metrics.MeasureSince([]string{"raft", "leader", "dispatchLog"}, now)
-
-	term := r.getCurrentTerm()
-	lastIndex := r.getLastIndex()
-
-	n := len(applyLogs)
-	logs := make([]*Log, n)
-	metrics.SetGauge([]string{"raft", "leader", "dispatchNumLogs"}, float32(n))
-
-	for idx, applyLog := range applyLogs {
-		applyLog.dispatch = now
-		lastIndex++
-		applyLog.log.Index = lastIndex
-		applyLog.log.Term = term
-		applyLog.log.AppendedAt = now
-		logs[idx] = &applyLog.log
-		r.leaderState.inflight.PushBack(applyLog)
-	}
-
-	// Write the log entry locally
-	if err := r.logs.StoreLogs(logs); err != nil {
-		r.logger.Error("failed to commit logs", "error", err)
-		for _, applyLog := range applyLogs {
-			applyLog.respond(err)
-		}
-		r.setState(Follower)
-		return
-	}
-	r.leaderState.commitment.match(r.localID, lastIndex)
-
-	// Update the last log since it's on disk now
-	r.setLastLog(lastIndex, term)
-
-	// 开始等待核心节点响应（如果coreNodesState不为nil）
-	if r.coreNodesState != nil {
-		r.coreNodesState.startWaitingForCoreNodes(lastIndex)
-
-		// 如果本地节点是核心节点，更新响应状态
-		if r.coreNodesState.isCoreNode(r.localID) {
-			r.coreNodesState.updateCoreNodeResponse(r.localID, true)
-		}
-	}
-
-	// Notify the replicators of the new log
-	for _, f := range r.leaderState.replState {
-		asyncNotifyCh(f.triggerCh)
-	}
-}
-
-// processLogs is used to apply all the committed entries that haven't been
-// applied up to the given index limit.
-// This can be called from both leaders and followers.
-// Followers call this from AppendEntries, for n entries at a time, and always
-// pass futures=nil.
-// Leaders call this when entries are committed. They pass the futures from any
-// inflight logs.
-func (r *Raft) processLogs(index uint64, futures map[uint64]*logFuture) {
-	// Reject logs we've applied already
-	lastApplied := r.getLastApplied()
-	if index <= lastApplied {
-		r.logger.Warn("skipping application of old log", "index", index)
-		return
-	}
-
-	applyBatch := func(batch []*commitTuple) {
-		select {
-		case r.fsmMutateCh <- batch:
-		case <-r.shutdownCh:
-			for _, cl := range batch {
-				if cl.future != nil {
-					cl.future.respond(ErrRaftShutdown)
-				}
-			}
-		}
-	}
-
-	// Store maxAppendEntries for this call in case it ever becomes reloadable. We
-	// need to use the same value for all lines here to get the expected result.
-	maxAppendEntries := r.config().MaxAppendEntries
-
-	batch := make([]*commitTuple, 0, maxAppendEntries)
-
-	// Apply all the preceding logs
-	for idx := lastApplied + 1; idx <= index; idx++ {
-		var preparedLog *commitTuple
-		// Get the log, either from the future or from our log store
-		future, futureOk := futures[idx]
-		if futureOk {
-			preparedLog = r.prepareLog(&future.log, future)
-		} else {
-			l := new(Log)
-			if err := r.logs.GetLog(idx, l); err != nil {
-				r.logger.Error("failed to get log", "index", idx, "error", err)
-				panic(err)
-			}
-			preparedLog = r.prepareLog(l, nil)
-		}
-
-		switch {
-		case preparedLog != nil:
-			// If we have a log ready to send to the FSM add it to the batch.
-			// The FSM thread will respond to the future.
-			batch = append(batch, preparedLog)
-
-			// If we have filled up a batch, send it to the FSM
-			if len(batch) >= maxAppendEntries {
-				applyBatch(batch)
-				batch = make([]*commitTuple, 0, maxAppendEntries)
-			}
-
-		case futureOk:
-			// Invoke the future if given.
-			future.respond(nil)
-		}
-	}
-
-	// If there are any remaining logs in the batch apply them
-	if len(batch) != 0 {
-		applyBatch(batch)
-	}
-
-	// Update the lastApplied index and term
-	r.setLastApplied(index)
-}
-
-// processLog is invoked to process the application of a single committed log entry.
-func (r *Raft) prepareLog(l *Log, future *logFuture) *commitTuple {
-	switch l.Type {
-	case LogBarrier:
-		// Barrier is handled by the FSM
-		fallthrough
-
-	case LogCommand:
-		return &commitTuple{l, future}
-
-	case LogConfiguration:
-		// Only support this with the v2 configuration format
-		if r.protocolVersion > 2 {
-			return &commitTuple{l, future}
-		}
-	case LogAddPeerDeprecated:
-	case LogRemovePeerDeprecated:
-	case LogNoop:
-		// Ignore the no-op
-
-	default:
-		panic(fmt.Errorf("unrecognized log type: %#v", l))
-	}
-
-	return nil
+	// 如果没有节点返回更高的任期，则仍然是领导者
+	v.respond(nil)
 }
 
 // processRPC is called to handle an incoming RPC request. This must only be
@@ -2138,4 +1607,101 @@ func (r *Raft) isCoreNode(id ServerID) bool {
 // updateCoreNodeResponse 更新核心节点的响应状态
 func (r *Raft) updateCoreNodeResponse(id ServerID, success bool) bool {
 	return r.coreNodesState.updateCoreNodeResponse(id, success)
+}
+
+// dispatchLogs 将日志条目添加到日志存储中，并开始复制
+func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
+	now := time.Now()
+	defer metrics.MeasureSince([]string{"raft", "leader", "dispatchLog"}, now)
+
+	term := r.getCurrentTerm()
+	lastIndex := r.getLastIndex()
+
+	n := len(applyLogs)
+	logs := make([]*Log, n)
+
+	for idx, applyLog := range applyLogs {
+		applyLog.dispatch = now
+		lastIndex++
+		applyLog.log.Index = lastIndex
+		applyLog.log.Term = term
+		applyLog.log.AppendedAt = now
+		logs[idx] = &applyLog.log
+		r.leaderState.inflight.PushBack(applyLog)
+	}
+
+	// 将日志条目写入本地存储
+	if err := r.logs.StoreLogs(logs); err != nil {
+		r.logger.Error("failed to commit logs", "error", err)
+		for _, applyLog := range applyLogs {
+			applyLog.respond(err)
+		}
+		r.setState(Follower)
+		return
+	}
+
+	// 更新最后的日志索引和任期
+	r.setLastLog(lastIndex, term)
+
+	// 通知复制器有新的日志
+	for _, f := range r.leaderState.replState {
+		asyncNotifyCh(f.triggerCh)
+	}
+}
+
+// checkLeaderLease 检查是否能够在领导者租约时间内联系到多数节点
+// 如果不能，需要下台。返回最大的联系时间差
+func (r *Raft) checkLeaderLease() time.Duration {
+	// 已联系的节点数，自己总是可以联系到
+	contacted := 1
+
+	// 获取租约超时时间
+	leaseTimeout := r.config().LeaderLeaseTimeout
+
+	// 检查每个跟随者
+	var maxDiff time.Duration
+	now := time.Now()
+	for _, server := range r.getLatestConfiguration().Servers {
+		if server.ID == r.localID {
+			continue
+		}
+
+		if server.Suffrage != Voter {
+			continue
+		}
+
+		f := r.leaderState.replState[server.ID]
+		if f == nil {
+			continue
+		}
+
+		diff := now.Sub(f.LastContact())
+		if diff <= leaseTimeout {
+			contacted++
+			if diff > maxDiff {
+				maxDiff = diff
+			}
+		} else {
+			r.logger.Warn("failed to contact", "server-id", server.ID, "time", diff)
+		}
+	}
+
+	// 验证是否能联系到多数节点
+	quorum := r.quorumSize()
+	if contacted < quorum {
+		r.logger.Warn("failed to contact quorum of nodes, stepping down")
+		r.setState(Follower)
+	}
+	return maxDiff
+}
+
+// quorumSize 返回多数节点的数量
+func (r *Raft) quorumSize() int {
+	voters := 0
+	for _, server := range r.getLatestConfiguration().Servers {
+		if server.Suffrage == Voter {
+			voters++
+		}
+	}
+	return voters/2 + 1
 }

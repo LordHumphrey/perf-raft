@@ -50,11 +50,11 @@ type Transport interface {
 	// the ReadCloser and streamed to the client.
 	InstallSnapshot(id ServerID, target ServerAddress, args *InstallSnapshotRequest, resp *InstallSnapshotResponse, data io.Reader) error
 
-	// EncodePeer is used to serialize a peer's address.
+	// EncodePeer is used to serialize a peer's ID and address.
 	EncodePeer(id ServerID, addr ServerAddress) []byte
 
-	// DecodePeer is used to deserialize a peer's address.
-	DecodePeer([]byte) ServerAddress
+	// DecodePeer is used to deserialize a peer's ID and address.
+	DecodePeer(p []byte) ServerAddress
 
 	// SetHeartbeatHandler is used to setup a heartbeat handler
 	// as a fast-pass. This is to avoid head-of-line blocking from
@@ -65,8 +65,7 @@ type Transport interface {
 	// TimeoutNow is used to start a leadership transfer to the target node.
 	TimeoutNow(id ServerID, target ServerAddress, args *TimeoutNowRequest, resp *TimeoutNowResponse) error
 
-	// CollaboratorReplicate 发送协作者复制请求到目标节点
-	// 如果Transport不支持此功能，可以返回ErrTransportShutdown
+	// CollaboratorReplicate 用于领导者向协作者节点发送日志复制请求
 	CollaboratorReplicate(id ServerID, target ServerAddress, args *CollaboratorReplicateRequest, resp *CollaboratorReplicateResponse) error
 }
 

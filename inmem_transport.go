@@ -101,7 +101,7 @@ func (i *InmemTransport) AppendEntriesPipeline(id ServerID, target ServerAddress
 
 // AppendEntries implements the Transport interface.
 func (i *InmemTransport) AppendEntries(id ServerID, target ServerAddress, args *AppendEntriesRequest, resp *AppendEntriesResponse) error {
-	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
+	rpcResp, err := i.makeRPC(target, rpcAppendEntries, args, i.timeout)
 	if err != nil {
 		return err
 	}
@@ -114,7 +114,7 @@ func (i *InmemTransport) AppendEntries(id ServerID, target ServerAddress, args *
 
 // RequestVote implements the Transport interface.
 func (i *InmemTransport) RequestVote(id ServerID, target ServerAddress, args *RequestVoteRequest, resp *RequestVoteResponse) error {
-	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
+	rpcResp, err := i.makeRPC(target, rpcRequestVote, args, i.timeout)
 	if err != nil {
 		return err
 	}
@@ -126,7 +126,7 @@ func (i *InmemTransport) RequestVote(id ServerID, target ServerAddress, args *Re
 }
 
 func (i *InmemTransport) RequestPreVote(id ServerID, target ServerAddress, args *RequestPreVoteRequest, resp *RequestPreVoteResponse) error {
-	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
+	rpcResp, err := i.makeRPC(target, rpcRequestPreVote, args, i.timeout)
 	if err != nil {
 		return err
 	}
@@ -139,7 +139,7 @@ func (i *InmemTransport) RequestPreVote(id ServerID, target ServerAddress, args 
 
 // InstallSnapshot implements the Transport interface.
 func (i *InmemTransport) InstallSnapshot(id ServerID, target ServerAddress, args *InstallSnapshotRequest, resp *InstallSnapshotResponse, data io.Reader) error {
-	rpcResp, err := i.makeRPC(target, args, data, 10*i.timeout)
+	rpcResp, err := i.makeRPC(target, rpcInstallSnapshot, args, 10*i.timeout)
 	if err != nil {
 		return err
 	}
@@ -152,7 +152,7 @@ func (i *InmemTransport) InstallSnapshot(id ServerID, target ServerAddress, args
 
 // TimeoutNow implements the Transport interface.
 func (i *InmemTransport) TimeoutNow(id ServerID, target ServerAddress, args *TimeoutNowRequest, resp *TimeoutNowResponse) error {
-	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
+	rpcResp, err := i.makeRPC(target, rpcTimeoutNow, args, i.timeout)
 	if err != nil {
 		return err
 	}
@@ -165,7 +165,7 @@ func (i *InmemTransport) TimeoutNow(id ServerID, target ServerAddress, args *Tim
 
 // CollaboratorReplicate implements the Transport interface.
 func (i *InmemTransport) CollaboratorReplicate(id ServerID, target ServerAddress, args *CollaboratorReplicateRequest, resp *CollaboratorReplicateResponse) error {
-	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
+	rpcResp, err := i.makeRPC(target, rpcCollaboratorReplicate, args, i.timeout)
 	if err != nil {
 		return err
 	}
@@ -176,7 +176,8 @@ func (i *InmemTransport) CollaboratorReplicate(id ServerID, target ServerAddress
 	return nil
 }
 
-func (i *InmemTransport) makeRPC(target ServerAddress, args interface{}, r io.Reader, timeout time.Duration) (rpcResp RPCResponse, err error) {
+// makeRPC is used to make an RPC call to a remote peer
+func (i *InmemTransport) makeRPC(target ServerAddress, rpcType uint8, args interface{}, timeout time.Duration) (rpcResp RPCResponse, err error) {
 	i.RLock()
 	peer, ok := i.peers[target]
 	i.RUnlock()
@@ -190,7 +191,6 @@ func (i *InmemTransport) makeRPC(target ServerAddress, args interface{}, r io.Re
 	respCh := make(chan RPCResponse, 1)
 	req := RPC{
 		Command:  args,
-		Reader:   r,
 		RespChan: respCh,
 	}
 	select {

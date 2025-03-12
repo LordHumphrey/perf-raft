@@ -15,9 +15,9 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 	// 设置响应
 	resp := &AppendEntriesResponse{
 		RPCHeader:      r.getRPCHeader(),
-		Term:          r.getCurrentTerm(),
-		LastLog:       r.getLastIndex(),
-		Success:       false,
+		Term:           r.getCurrentTerm(),
+		LastLog:        r.getLastIndex(),
+		Success:        false,
 		NoRetryBackoff: false,
 	}
 	var rpcErr error
@@ -74,75 +74,34 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		}
 	}
 
-	// 处理新的日志条目
+	// 应用日志条目
 	if len(a.Entries) > 0 {
-		start := time.Now()
+		// 获取当前最后的日志索引和任期
+		lastLogIdx, lastLogTerm := r.getLastLog()
 
-		// 删除冲突的日志条目，跳过重复的条目
-		lastLogIdx, _ := r.getLastLog()
-		var newEntries []*Log
-		for i, entry := range a.Entries {
-			if entry.Index > lastLogIdx {
-				newEntries = a.Entries[i:]
-				break
-			}
-			var storeEntry Log
-			if err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {
-				r.logger.Warn("无法获取日志条目",
-					"index", entry.Index,
-					"error", err)
-				return
-			}
-			if entry.Term != storeEntry.Term {
-				r.logger.Warn("清除日志后缀", "from", entry.Index, "to", lastLogIdx)
-				if err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {
-					r.logger.Error("无法清除日志后缀", "error", err)
-					return
-				}
-				if entry.Index <= r.configurations.latestIndex {
-					r.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)
-				}
-				newEntries = a.Entries[i:]
-				break
-			}
+		// 删除冲突的日志条目，然后添加新的日志条目
+		if err := r.logs.DeleteRange(a.PrevLogEntry+1, lastLogIdx); err != nil {
+			r.logger.Error("failed to delete conflict logs", "error", err)
+			return
 		}
 
-		if n := len(newEntries); n > 0 {
-			// 追加新的日志条目
-			if err := r.logs.StoreLogs(newEntries); err != nil {
-				r.logger.Error("无法追加到日志", "error", err)
-				return
-			}
-
-			// 处理新的配置变更
-			for _, newEntry := range newEntries {
-				if err := r.processConfigurationLogEntry(newEntry); err != nil {
-					r.logger.Warn("无法追加条目",
-						"index", newEntry.Index,
-						"error", err)
-					rpcErr = err
-					return
-				}
-			}
-
-			// 更新最后的日志
-			last := newEntries[n-1]
-			r.setLastLog(last.Index, last.Term)
+		// 追加日志条目
+		if err := r.logs.StoreLogs(a.Entries); err != nil {
+			r.logger.Error("failed to append logs", "error", err)
+			return
 		}
 
-		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "storeLogs"}, start)
+		// 更新最后一条日志的索引和任期
+		lastLogIdx = a.Entries[len(a.Entries)-1].Index
+		lastLogTerm = a.Entries[len(a.Entries)-1].Term
+		r.setLastLog(lastLogIdx, lastLogTerm)
 	}
 
 	// 更新提交索引
 	if a.LeaderCommitIndex > 0 && a.LeaderCommitIndex > r.getCommitIndex() {
-		start := time.Now()
 		idx := min(a.LeaderCommitIndex, r.getLastIndex())
 		r.setCommitIndex(idx)
-		if r.configurations.latestIndex <= idx {
-			r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
-		}
-		r.processLogs(idx, nil)
-		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "processLogs"}, start)
+		r.processCommittedLogs(r.getCommitIndex())
 	}
 
 	// 如果是核心节点且有新的日志条目，更新核心节点响应状态
@@ -150,7 +109,48 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		r.coreNodesState.updateCoreNodeResponse(r.localID, true)
 	}
 
-	// 一切顺利，设置成功
+	// 一切正常，返回成功
 	resp.Success = true
 	r.setLastContact()
+}
+
+// processCommittedLogs 处理已提交但尚未应用的日志条目
+func (r *Raft) processCommittedLogs(commitIndex uint64) {
+	// 获取最后应用的索引
+	lastApplied := r.getLastApplied()
+	if commitIndex <= lastApplied {
+		return
+	}
+
+	// 应用所有未应用的日志条目
+	for idx := lastApplied + 1; idx <= commitIndex; idx++ {
+		// 获取日志条目
+		var log Log
+		if err := r.logs.GetLog(idx, &log); err != nil {
+			r.logger.Error("failed to get log", "index", idx, "error", err)
+			panic(err)
+		}
+
+		// 应用日志条目
+		switch log.Type {
+		case LogCommand:
+			// 将命令应用到状态机
+			r.fsm.Apply(&log)
+		case LogConfiguration:
+			// 处理配置变更
+			var configuration Configuration
+			configuration = DecodeConfiguration(log.Data)
+			r.setCommittedConfiguration(configuration, log.Index)
+		case LogBarrier:
+			// 屏障日志也需要应用到状态机
+			r.fsm.Apply(&log)
+		case LogNoop:
+			// 忽略空操作日志
+		default:
+			r.logger.Warn("unrecognized log type", "type", log.Type)
+		}
+	}
+
+	// 更新最后应用的索引
+	r.setLastApplied(commitIndex)
 }
