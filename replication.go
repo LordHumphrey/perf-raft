@@ -252,6 +252,19 @@ START:
 		// Clear any failures, allow pipelining
 		s.failures = 0
 		s.allowPipeline = true
+
+		// 如果是核心节点且有新的日志条目，更新核心节点响应状态
+		if len(req.Entries) > 0 && r.coreNodesState != nil && r.coreNodesState.isCoreNode(peer.ID) {
+			// 如果所有核心节点都已响应，提交日志
+			if r.coreNodesState.updateCoreNodeResponse(peer.ID, true) {
+				// 获取最后等待的日志索引
+				lastWaitingIndex := r.coreNodesState.getLastWaitingIndex()
+				// 更新提交索引
+				r.setCommitIndex(lastWaitingIndex)
+				// 通知提交
+				asyncNotifyCh(r.leaderState.commitCh)
+			}
+		}
 	} else {
 		atomic.StoreUint64(&s.nextIndex, max(min(s.nextIndex-1, resp.LastLog+1), 1))
 		if resp.NoRetryBackoff {

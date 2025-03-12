@@ -222,6 +222,9 @@ type Raft struct {
 	// legacy metrics are those that have `_peer_name` as metric suffix instead as labels.
 	// e.g: raft_replication_heartbeat_peer0
 	noLegacyTelemetry bool
+
+	// coreNodesState 管理核心节点状态，用于两阶段日志分发
+	coreNodesState *coreNodesState
 }
 
 // BootstrapCluster initializes a server's storage with the given cluster
@@ -575,6 +578,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		mainThreadSaturation:  newSaturationMetric([]string{"raft", "thread", "main", "saturation"}, 1*time.Second),
 		preVoteDisabled:       conf.PreVoteDisabled || !transportSupportPreVote,
 		noLegacyTelemetry:     conf.NoLegacyTelemetry,
+		coreNodesState:        newCoreNodesState(),
 	}
 	if !transportSupportPreVote && !conf.PreVoteDisabled {
 		r.logger.Warn("pre-vote is disabled because it is not supported by the Transport")

@@ -121,6 +121,13 @@ func (r *Raft) requestConfigChange(req configurationChangeRequest, timeout time.
 		req: req,
 	}
 	future.init()
+
+	// 如果当前正在等待核心节点响应，重置等待状态
+	// 这是为了避免在配置变更时阻塞
+	if r.getState() == Leader && r.coreNodesState != nil && r.coreNodesState.isWaitingForCoreNodes() {
+		r.coreNodesState.resetWaitingState()
+	}
+
 	select {
 	case <-timer:
 		return errorFuture{ErrEnqueueTimeout}
@@ -461,6 +468,11 @@ func (r *Raft) setupLeaderState() {
 	r.leaderState.replState = make(map[ServerID]*followerReplication)
 	r.leaderState.notify = make(map[*verifyFuture]struct{})
 	r.leaderState.stepDown = make(chan struct{}, 1)
+
+	// 更新核心节点列表（如果coreNodesState不为nil）
+	if r.coreNodesState != nil {
+		r.coreNodesState.updateCoreNodes(r.configurations.latest)
+	}
 }
 
 // runLeader runs the main loop while in leader state. Do the setup here and drop into
@@ -655,6 +667,13 @@ func (r *Raft) configurationChangeChIfStable() chan *configurationChangeFuture {
 	// 1. The latest configuration is committed, and
 	// 2. This leader has committed some entry (the noop) in this term
 	//    https://groups.google.com/forum/#!msg/raft-dev/t4xj6dJTP6E/d2D9LrWRza8J
+
+	// 如果当前正在等待核心节点响应，重置等待状态
+	// 这是为了避免在配置变更时阻塞
+	if r.coreNodesState != nil && r.coreNodesState.isWaitingForCoreNodes() {
+		r.coreNodesState.resetWaitingState()
+	}
+
 	if r.configurations.latestIndex == r.configurations.committedIndex &&
 		r.getCommitIndex() >= r.leaderState.commitment.startIndex {
 		return r.configurationChangeCh
@@ -1276,6 +1295,16 @@ func (r *Raft) dispatchLogs(applyLogs []*logFuture) {
 	// Update the last log since it's on disk now
 	r.setLastLog(lastIndex, term)
 
+	// 开始等待核心节点响应（如果coreNodesState不为nil）
+	if r.coreNodesState != nil {
+		r.coreNodesState.startWaitingForCoreNodes(lastIndex)
+
+		// 如果本地节点是核心节点，更新响应状态
+		if r.coreNodesState.isCoreNode(r.localID) {
+			r.coreNodesState.updateCoreNodeResponse(r.localID, true)
+		}
+	}
+
 	// Notify the replicators of the new log
 	for _, f := range r.leaderState.replState {
 		asyncNotifyCh(f.triggerCh)
@@ -1435,151 +1464,6 @@ func (r *Raft) processHeartbeat(rpc RPC) {
 	}
 }
 
-// appendEntries is invoked when we get an append entries RPC call. This must
-// only be called from the main thread.
-func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
-	defer metrics.MeasureSince([]string{"raft", "rpc", "appendEntries"}, time.Now())
-	// Setup a response
-	resp := &AppendEntriesResponse{
-		RPCHeader:      r.getRPCHeader(),
-		Term:           r.getCurrentTerm(),
-		LastLog:        r.getLastIndex(),
-		Success:        false,
-		NoRetryBackoff: false,
-	}
-	var rpcErr error
-	defer func() {
-		rpc.Respond(resp, rpcErr)
-	}()
-
-	// Ignore an older term
-	if a.Term < r.getCurrentTerm() {
-		return
-	}
-
-	// Increase the term if we see a newer one, also transition to follower
-	// if we ever get an appendEntries call
-	if a.Term > r.getCurrentTerm() || (r.getState() != Follower && !r.candidateFromLeadershipTransfer.Load()) {
-		// Ensure transition to follower
-		r.setState(Follower)
-		r.setCurrentTerm(a.Term)
-		resp.Term = a.Term
-	}
-
-	// Save the current leader
-	if len(a.Addr) > 0 {
-		r.setLeader(r.trans.DecodePeer(a.Addr), ServerID(a.ID))
-	} else {
-		r.setLeader(r.trans.DecodePeer(a.Leader), ServerID(a.ID))
-	}
-	// Verify the last log entry
-	if a.PrevLogEntry > 0 {
-		lastIdx, lastTerm := r.getLastEntry()
-
-		var prevLogTerm uint64
-		if a.PrevLogEntry == lastIdx {
-			prevLogTerm = lastTerm
-		} else {
-			var prevLog Log
-			if err := r.logs.GetLog(a.PrevLogEntry, &prevLog); err != nil {
-				r.logger.Warn("failed to get previous log",
-					"previous-index", a.PrevLogEntry,
-					"last-index", lastIdx,
-					"error", err)
-				resp.NoRetryBackoff = true
-				return
-			}
-			prevLogTerm = prevLog.Term
-		}
-
-		if a.PrevLogTerm != prevLogTerm {
-			r.logger.Warn("previous log term mis-match",
-				"ours", prevLogTerm,
-				"remote", a.PrevLogTerm)
-			resp.NoRetryBackoff = true
-			return
-		}
-	}
-
-	// Process any new entries
-	if len(a.Entries) > 0 {
-		start := time.Now()
-
-		// Delete any conflicting entries, skip any duplicates
-		lastLogIdx, _ := r.getLastLog()
-		var newEntries []*Log
-		for i, entry := range a.Entries {
-			if entry.Index > lastLogIdx {
-				newEntries = a.Entries[i:]
-				break
-			}
-			var storeEntry Log
-			if err := r.logs.GetLog(entry.Index, &storeEntry); err != nil {
-				r.logger.Warn("failed to get log entry",
-					"index", entry.Index,
-					"error", err)
-				return
-			}
-			if entry.Term != storeEntry.Term {
-				r.logger.Warn("clearing log suffix", "from", entry.Index, "to", lastLogIdx)
-				if err := r.logs.DeleteRange(entry.Index, lastLogIdx); err != nil {
-					r.logger.Error("failed to clear log suffix", "error", err)
-					return
-				}
-				if entry.Index <= r.configurations.latestIndex {
-					r.setLatestConfiguration(r.configurations.committed, r.configurations.committedIndex)
-				}
-				newEntries = a.Entries[i:]
-				break
-			}
-		}
-
-		if n := len(newEntries); n > 0 {
-			// Append the new entries
-			if err := r.logs.StoreLogs(newEntries); err != nil {
-				r.logger.Error("failed to append to logs", "error", err)
-				// TODO: leaving r.getLastLog() in the wrong
-				// state if there was a truncation above
-				return
-			}
-
-			// Handle any new configuration changes
-			for _, newEntry := range newEntries {
-				if err := r.processConfigurationLogEntry(newEntry); err != nil {
-					r.logger.Warn("failed to append entry",
-						"index", newEntry.Index,
-						"error", err)
-					rpcErr = err
-					return
-				}
-			}
-
-			// Update the lastLog
-			last := newEntries[n-1]
-			r.setLastLog(last.Index, last.Term)
-		}
-
-		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "storeLogs"}, start)
-	}
-
-	// Update the commit index
-	if a.LeaderCommitIndex > 0 && a.LeaderCommitIndex > r.getCommitIndex() {
-		start := time.Now()
-		idx := min(a.LeaderCommitIndex, r.getLastIndex())
-		r.setCommitIndex(idx)
-		if r.configurations.latestIndex <= idx {
-			r.setCommittedConfiguration(r.configurations.latest, r.configurations.latestIndex)
-		}
-		r.processLogs(idx, nil)
-		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "processLogs"}, start)
-	}
-
-	// Everything went well, set success
-	resp.Success = true
-	r.setLastContact()
-}
-
-// processConfigurationLogEntry takes a log entry and updates the latest
 // configuration if the entry results in a new configuration. This must only be
 // called from the main thread, or from NewRaft() before any threads have begun.
 func (r *Raft) processConfigurationLogEntry(entry *Log) error {
@@ -2238,4 +2122,14 @@ func (r *Raft) getLatestConfiguration() Configuration {
 	default:
 		return Configuration{}
 	}
+}
+
+// isCoreNode 判断给定的节点ID是否是核心节点
+func (r *Raft) isCoreNode(id ServerID) bool {
+	return r.coreNodesState.isCoreNode(id)
+}
+
+// updateCoreNodeResponse 更新核心节点的响应状态
+func (r *Raft) updateCoreNodeResponse(id ServerID, success bool) bool {
+	return r.coreNodesState.updateCoreNodeResponse(id, success)
 }
