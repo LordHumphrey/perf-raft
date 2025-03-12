@@ -64,6 +64,10 @@ type Transport interface {
 
 	// TimeoutNow is used to start a leadership transfer to the target node.
 	TimeoutNow(id ServerID, target ServerAddress, args *TimeoutNowRequest, resp *TimeoutNowResponse) error
+
+	// CollaboratorReplicate 发送协作者复制请求到目标节点
+	// 如果Transport不支持此功能，可以返回ErrTransportShutdown
+	CollaboratorReplicate(id ServerID, target ServerAddress, args *CollaboratorReplicateRequest, resp *CollaboratorReplicateResponse) error
 }
 
 // WithPreVote is an interface that a transport may provide which

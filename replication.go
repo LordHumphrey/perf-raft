@@ -43,6 +43,10 @@ type followerReplication struct {
 	// which may fall past the end of the log.
 	nextIndex uint64
 
+	// matchIndex is the index of the highest log entry known to be replicated
+	// on the follower. This is used by the leader to update its commitIndex.
+	matchIndex uint64
+
 	// peer contains the network address and ID of the remote follower.
 	peer Server
 	// peerLock protects 'peer'
@@ -668,6 +672,7 @@ func updateLastAppended(s *followerReplication, req *AppendEntriesRequest) {
 	if logs := req.Entries; len(logs) > 0 {
 		last := logs[len(logs)-1]
 		atomic.StoreUint64(&s.nextIndex, last.Index+1)
+		atomic.StoreUint64(&s.matchIndex, last.Index)
 		s.commitment.match(s.peer.ID, last.Index)
 	}
 

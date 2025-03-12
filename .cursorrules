@@ -74,4 +74,5 @@
     *   Your code must be free of bugs and errors.  Thorough testing is essential.
 -   **Communication:**
     *   While internal reasoning can be in English, all written communication (including responses to questions and code comments) *must* be in Chinese.
+- 如果你无法获取测试结果，请你把测试结果写入到`test_result.txt`文件中，然后读取`test_result.txt`文件中的内容获得测试结果，根据测试结果你需要继续修改代码，直到能够通过测试。你不能为了通过测试而修改测试代码为更简单的测试用例！
 - 我是一个追求完美的程序员，我要求你给出的代码必须完美无瑕，不能有任何的bug，否则我会联系你的老板，你将会失去工作成为流浪汉！

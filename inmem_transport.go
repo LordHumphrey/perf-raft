@@ -152,13 +152,26 @@ func (i *InmemTransport) InstallSnapshot(id ServerID, target ServerAddress, args
 
 // TimeoutNow implements the Transport interface.
 func (i *InmemTransport) TimeoutNow(id ServerID, target ServerAddress, args *TimeoutNowRequest, resp *TimeoutNowResponse) error {
-	rpcResp, err := i.makeRPC(target, args, nil, 10*i.timeout)
+	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
 	if err != nil {
 		return err
 	}
 
 	// Copy the result back
 	out := rpcResp.Response.(*TimeoutNowResponse)
+	*resp = *out
+	return nil
+}
+
+// CollaboratorReplicate implements the Transport interface.
+func (i *InmemTransport) CollaboratorReplicate(id ServerID, target ServerAddress, args *CollaboratorReplicateRequest, resp *CollaboratorReplicateResponse) error {
+	rpcResp, err := i.makeRPC(target, args, nil, i.timeout)
+	if err != nil {
+		return err
+	}
+
+	// Copy the result back
+	out := rpcResp.Response.(*CollaboratorReplicateResponse)
 	*resp = *out
 	return nil
 }

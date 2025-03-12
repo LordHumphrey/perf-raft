@@ -614,6 +614,7 @@ func (r *Raft) startStopReplication() {
 				triggerDeferErrorCh: make(chan *deferError, 1),
 				currentTerm:         r.getCurrentTerm(),
 				nextIndex:           lastIdx + 1,
+				matchIndex:          0, // 初始化为0，表示还没有复制任何日志
 				lastContact:         time.Now(),
 				notify:              make(map[*verifyFuture]struct{}),
 				notifyCh:            make(chan struct{}, 1),
@@ -961,6 +962,9 @@ func (r *Raft) leaderLoop() {
 			if checkInterval < minCheckInterval {
 				checkInterval = minCheckInterval
 			}
+
+			// 通过协作者复制日志到非核心节点
+			r.replicateToNonCoreNodes()
 
 			// Renew the lease timer
 			lease = time.After(checkInterval)
@@ -1433,6 +1437,8 @@ func (r *Raft) processRPC(rpc RPC) {
 		r.installSnapshot(rpc, cmd)
 	case *TimeoutNowRequest:
 		r.timeoutNow(rpc, cmd)
+	case *CollaboratorReplicateRequest:
+		r.collaboratorReplicate(rpc, cmd)
 	default:
 		r.logger.Error("got unexpected command",
 			"command", hclog.Fmt("%#v", rpc.Command))

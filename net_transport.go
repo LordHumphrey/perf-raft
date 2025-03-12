@@ -25,6 +25,7 @@ const (
 	rpcInstallSnapshot
 	rpcTimeoutNow
 	rpcRequestPreVote
+	rpcCollaboratorReplicate
 
 	// DefaultTimeoutScale is the default TimeoutScale in a NetworkTransport.
 	DefaultTimeoutScale = 256 * 1024 // 256KB
@@ -559,6 +560,11 @@ func (n *NetworkTransport) TimeoutNow(id ServerID, target ServerAddress, args *T
 	return n.genericRPC(id, target, rpcTimeoutNow, args, resp)
 }
 
+// CollaboratorReplicate implements the Transport interface.
+func (n *NetworkTransport) CollaboratorReplicate(id ServerID, target ServerAddress, args *CollaboratorReplicateRequest, resp *CollaboratorReplicateResponse) error {
+	return n.genericRPC(id, target, rpcCollaboratorReplicate, args, resp)
+}
+
 // listen is used to handling incoming connections.
 func (n *NetworkTransport) listen() {
 	const baseDelay = 5 * time.Millisecond
@@ -713,6 +719,13 @@ func (n *NetworkTransport) handleCommand(r *bufio.Reader, dec *codec.Decoder, en
 		}
 		rpc.Command = &req
 		labels = []metrics.Label{{Name: "rpcType", Value: "TimeoutNow"}}
+	case rpcCollaboratorReplicate:
+		var req CollaboratorReplicateRequest
+		if err := dec.Decode(&req); err != nil {
+			return err
+		}
+		rpc.Command = &req
+		labels = []metrics.Label{{Name: "rpcType", Value: "CollaboratorReplicate"}}
 	default:
 		return fmt.Errorf("unknown rpc type %d", rpcType)
 	}
