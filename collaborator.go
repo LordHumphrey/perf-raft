@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hashicorp/go-metrics/compat"
+	metrics "github.com/hashicorp/go-metrics/compat"
 )
 
 // CollaboratorReplicateRequest 是领导者发送给协作者的请求，
@@ -312,42 +312,43 @@ func (r *Raft) replicateToNonCoreNodes() {
 	}
 }
 
-// getCollaborator 获取协作者节点
+// 修改说明：改进 getCollaborator 方法，确保如果第一个非领导者节点因复制状态未同步而未识别时，顺延选择后续候选节点作为协作者。
+// 同时如果核心节点列表为空或仅包含领导者，打印调试信息便于追踪问题。
 func (r *Raft) getCollaborator() *Server {
-	// 如果自己是领导者，不需要协作者
+	// 如果自己不是领导者，则不使用协作者
 	if r.getState() != Leader {
 		return nil
 	}
-
 	if r.coreNodesState == nil {
 		return nil
 	}
-
 	coreNodes := r.coreNodesState.getCoreNodes()
-	if len(coreNodes) <= 1 {
+	// 如果核心节点列表为空或者仅包含领导者，则返回nil
+	if len(coreNodes) == 0 || (len(coreNodes) == 1 && coreNodes[0] == r.localID) {
+		r.logger.Debug("核心节点列表为空或仅包含领导者")
 		return nil
 	}
-
-	// 协作者是核心节点组中的第一个非领导者节点
+	var fallback *Server = nil
+	// 获取最新配置
+	configuration := r.getLatestConfiguration()
+	// 遍历核心节点，选择第一个非领导者节点，如果复制状态未同步则暂存为后备候选
 	for _, nodeID := range coreNodes {
-		// 跳过自己（领导者）
+		// 跳过领导者节点
 		if nodeID == r.localID {
 			continue
 		}
-
-		// 从配置中查找协作者的地址
-		configuration := r.getLatestConfiguration()
 		for _, server := range configuration.Servers {
 			if server.ID == nodeID {
-				// 检查节点是否在线（通过检查replState）
+				// 检查节点是否在线（通过 leaderState.replState 判断）
 				if _, ok := r.leaderState.replState[server.ID]; ok {
 					return &server
+				} else if fallback == nil {
+					fallback = &server
 				}
 			}
 		}
 	}
-
-	return nil
+	return fallback
 }
 
 // getNonCoreNodes 获取需要更新的非核心节点列表

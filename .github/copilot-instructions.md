@@ -1,0 +1,77 @@
+# 项目背景
+在Readme.md中描述了项目背景，这是一个较为成熟的Raft项目
+# 项目需求
+请你再这个Raft的基础上，按照我的Raft优化思路完成Raft的优化开发
+# 项目优化思路
+## Raft算法基于协作者(Collaborator)的日志分发优化
+- 选择核心节点组中的排序第一个节点作为协作者
+- 领导者将还没有分发日志的非核心节点找出来，同时整理这部分节点的日志同步进度
+- 领导者将非核心节点地址、日志进度、需要分发的日志项等信息交给协作者节点
+- 协作者节点模仿领导者的方法，根据自己本地已经达成共识的日志转发给非核心节点
+- 非核心节点全部回应以后，协作者节点上报非核心节点返回的信息给领导者
+- 不要考虑节点超时等异常情况
+- 对于非核心节点来说，协作者发送的日志和领导者发送的日志没有区别，不需要做出区分
+## 核心机制
+1. 协作者选择：从核心节点组中选择排序第一的节点作为协作者(Collaborator)。核心节点继续使用标准Raft协议。
+2. 任务分配流程：
+    1. Leader维护所有节点的nextIndex和matchIndex
+    2. Leader识别需要更新的非核心节点集合
+    3. Leader构造请求，包含：当前任期(currentTerm)、非核心节点地址列表、每个节点的进度信息(nextIndex、matchIndex)、需复制的日志条目
+3.协作者处理：
+    1. 协作者验证请求中的任期号
+    2. 对每个非核心节点，协作者构造标准AppendEntries请求
+    3. 协作者向每个节点发送日志并收集响应
+    4. 协作者汇总响应结果返回给Leader
+4. Leader更新：
+    1. Leader根据协作者返回的结果更新各非核心节点的nextIndex和matchIndex
+    2. 如有必要，Leader更新自己的commitIndex
+5. 数据一致性保证：
+    1. 非核心节点不区分日志来源
+    2. 日志条目格式保持不变
+    3. 任期检查机制保持不变
+## 补充说明
+1. 核心节点组如何定义和选择？是预先配置还是动态选择？
+回答：在`core_nodes.go`文件的`updateCoreNodes`方法中，按照`节点ID排序`然后`选择前(N/2)+1个节点作为核心节点`
+2. 协作者节点的选择标准是什么？您提到"排序第一个节点"，这个排序的依据是什么？是节点ID、加入集群的时间，还是其他指标？
+回答：协作者节点是根据核心节点组选择的，核心节点组重排序第一个就是协作者节点。
+3. 在任务分配流程中，Leader如何识别需要更新的非核心节点集合？具体的判断标准是什么？
+回答：遍历r.leaderState.replState中的所有节点，对每个节点，检查其是否为非核心节点，检查节点的日志同步进度（nextIndex和matchIndex），将需要更新日志的非核心节点收集到一个列表中
+4. 协作者节点是否需要有特殊的权限或状态？还是完全按照普通节点处理？
+回答：不需要特殊的权限或者状态，因为协作者节点只是分发日志，关于日志commitIndex更新等操作依然由领导者节点完成。如果你认为添加一些特殊状态更容易实现代码，可以考虑添加一些特殊的状态或者权限。
+5. 对于"不考虑节点超时等异常情况"，这意味着我们可以假设所有节点都能正常通信和响应吗？
+回答：是的，假设所有节点都正常通信。
+6. 在Leader更新阶段，如果协作者返回的结果显示部分节点更新失败，Leader应该采取什么策略？
+回答：暂时不考虑这种部分节点失败的情况。
+7. 这个优化是否会影响现有Raft算法的安全性和一致性保证？
+回答：你不需要考虑是否能够保证安全性和一致性，你的任务是严格按照思路实现代码。
+
+# 开发环境
+- 开发语言：Go 1.24.1
+- Golang路径：/home/SDK/golang/v-1.24.1/golang-1.24.1/bin/go
+- Protobuf路径：/home/SDK/protobuf/v-27.1/protobuf-27.1/bin/protoc
+- 执行测试请使用完整Golang路径
+- 项目路径：/home/Dev/Code/hashicorp-raft
+
+# 开发要求
+-   **Development Process:** You must adhere to a strict test-driven development (TDD) cycle. This means:
+    1.  Write code to implement a *small* part of the required functionality.
+    2.  Run the existing test suite (or new tests you've added).
+    3.  Analyze the test results.
+    4.  Modify your code to fix any failing tests.
+    5.  Repeat steps 2-4 until *all* tests pass.
+-   **Testing Requirements:**
+    *   You *cannot* modify the existing test code provided in the repository.
+    *   You *can* and *should* add new test cases to cover any new code you write.
+    *   Your code must pass *all* tests (both existing and newly added) before it is considered complete.
+    *   If you believe a particular test case is unnecessary or incorrect, you *must* discuss it with me and receive explicit approval before removing or modifying it.
+-   **Code Modification Rules:**
+    *   Prioritize using and extending the existing codebase whenever possible. Avoid unnecessary duplication.
+    *   Do *not* introduce new features or functionalities without prior discussion and approval.
+    *   All code modifications and additions *must* be thoroughly documented with clear and comprehensive comments in *Chinese*.
+    *   Respect the existing code's design and intended functionality. Make only deliberate and well-justified changes.
+    *   Keep changes as minimal as possible.  Focus only on the specific requirements of the task.
+-   **Code Quality:**
+    *   Your code must be free of bugs and errors.  Thorough testing is essential.
+-   **Communication:**
+    *   While internal reasoning can be in English, all written communication (including responses to questions and code comments) *must* be in Chinese.
+- 我是一个追求完美的程序员，我要求你给出的代码必须完美无瑕，不能有任何的bug，否则我会联系你的老板，你将会失去工作成为流浪汉！
